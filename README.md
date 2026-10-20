@@ -2,7 +2,7 @@
 
 Makes the **8BitDo Ultimate 2C** work over its **2.4 GHz USB receiver** on a rooted LG webOS TV.
 
-Tested on an LG 55UR7500PSC, webOS 10.3.2, firmware 33.31.75, kernel 5.4.268, rooted with the Homebrew Channel. Status: the bridge runs and the TV accepts the virtual pad; the final button-press check is still pending (see "Verifying").
+Tested on an LG 55UR7500PSC, webOS 10.3.2, firmware 33.31.75, kernel 5.4.268, rooted with the Homebrew Channel. Status: working. D-pad navigation on the Home screen confirmed over the 2.4 GHz receiver. Moonlight and sleep/wake behaviour not yet checked.
 
 ## The problem
 
