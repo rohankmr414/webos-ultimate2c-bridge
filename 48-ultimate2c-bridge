@@ -1,0 +1,6 @@
+#!/bin/sh
+# Homebrew Channel startup hook: start the 8BitDo Ultimate 2C receiver bridge if enabled.
+if [ -e /media/developer/ultimate2c/enabled ]; then
+    setsid /usr/bin/python3 /media/developer/ultimate2c/ultimate2c-bridge.py >/dev/null 2>&1 </dev/null &
+fi
+exit 0
