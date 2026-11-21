@@ -75,6 +75,15 @@ Removes the marker, hook and daemon; the kernel `xpad` driver rebinds automatica
 | `ultimate2c-bridge.py` | The daemon |
 | `48-ultimate2c-bridge` | Homebrew Channel startup hook |
 | `install.sh` / `uninstall.sh` | Run from a workstation with SSH access to the TV |
+| `tests/test_bridge.py` | Hardware-free unit tests |
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Standard library only. usbfs, uinput, sysfs and the clock are faked, so the tests run on any Linux workstation without the receiver.
 
 ## Notes
 
