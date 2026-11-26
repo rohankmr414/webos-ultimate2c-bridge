@@ -17,7 +17,8 @@ Observed on the receiver's XInput interface:
 | nothing | none |
 | rumble `00 08 00 LL RR 00 00 00` | none |
 | set-LED `01 03 02` | stream of 20-byte XInput reports |
-| rumble while streaming | stream stops |
+| rumble with sequential USB I/O | reports can pause until the motors stop |
+| rumble with concurrent input reads | reports continued during a test pulse |
 
 ## The fix
 
@@ -27,9 +28,15 @@ Observed on the receiver's XInput interface:
 2. Creates a uinput pad named "Generic X-Box pad" (bus USB, `2dc8:310a`) with the same buttons, axes and ranges `xpad` would create.
 3. Detaches `xpad` from interface 0 via usbfs, claims it, sends the XInput capability requests and the LED packet.
 4. Parses the XInput reports with the `xpad` mapping and writes only changed values to uinput.
-5. Repeats the handshake every 10 s until the first report, then only after 60 s of silence. When the receiver disappears or goes to its "8BitDo IDLE" state it hands the interface back to `xpad` and waits again.
+5. Repeats the handshake every 10 s until the first report, then only after 60 s of silence. When the receiver disappears or enters "8BitDo IDLE", the bridge releases held inputs and leaves the virtual pad connected for up to 15 seconds. The same receiver can reuse that pad and its force-feedback effects. The bridge identifies it by USB serial, with a same-port fallback for receivers that provide no serial.
 
-No force feedback is advertised, because a rumble packet silences the receiver. CPU use is negligible. Log: `/tmp/ultimate2c-bridge.log`.
+Log: `/tmp/ultimate2c-bridge.log`.
+
+## Optional rumble
+
+Create `/media/developer/ultimate2c/rumble-enabled` on the TV and restart the bridge to advertise standard two-motor force feedback. Reopen Moonlight so it reads the updated controller capabilities. To turn it off, remove that marker and restart the bridge.
+
+The bridge sends motor commands from a separate thread while USB input reads continue. It stops the motors if input reports go quiet or when the receiver session ends.
 
 ## Requirements
 

@@ -9,12 +9,14 @@ over through usbfs, performs the LED handshake, reads the 20-byte XInput reports
 and republishes them through uinput with the same capabilities and names the xpad
 driver would have produced, so webOS (libim) and apps treat it as a normal pad.
 
-A rumble packet (00 08 ...) silences the receiver again, so no rumble is sent and
-the uinput device does not advertise force feedback.
+Rumble is opt-in. When enabled, a worker handles uinput feedback and sends motor
+commands concurrently with the receiver's input reads.
 
 Run as root. Stops cleanly on SIGTERM/SIGINT and hands the interface back to xpad.
 """
 import os, sys, time, struct, ctypes, fcntl, errno, signal, glob
+import select
+import threading
 
 VID, PID = 0x2dc8, 0x310a
 EP_IN, EP_OUT = 0x84, 0x05
@@ -23,6 +25,9 @@ HANDSHAKE_RETRY_S = 10.0               # until the first report: repeat the hand
 SILENCE_RETRY_S = 60.0                 # after reports have been seen: repeat only after this much silence
 LOG = "/tmp/ultimate2c-bridge.log"
 UINPUT_NAME = "Generic X-Box pad"      # same name xpad gives this receiver
+RUMBLE_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rumble-enabled")
+RUMBLE_INPUT_TIMEOUT_S = 0.3
+RECONNECT_GRACE_S = 15.0
 
 P = struct.calcsize("P")
 def _IOC(d, t, nr, size): return (d << 30) | (size << 16) | (ord(t) << 8) | nr
@@ -45,6 +50,19 @@ AXES = [(ABS_X, -32768, 32767, 16, 128), (ABS_Y, -32768, 32767, 16, 128), (ABS_R
         (ABS_RY, -32768, 32767, 16, 128), (ABS_Z, 0, 255, 0, 0), (ABS_RZ, 0, 255, 0, 0),
         (ABS_HAT0X, -1, 1, 0, 0), (ABS_HAT0Y, -1, 1, 0, 0)]
 EVENT_FMT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+EV_FF, EV_UINPUT = 0x15, 0x0101
+FF_RUMBLE, FF_EFFECTS_MAX = 0x50, 8
+UI_FF_UPLOAD, UI_FF_ERASE = 1, 2
+UI_SET_FFBIT = _IOC(1, "U", 107, 4)
+# The largest ff_effect union member contains a native pointer. The upload
+# record holds two effects after its request id and return value (linux/uinput.h).
+FF_EFFECT_SIZE = 44 if P == 4 else 48
+FF_UPLOAD_SIZE = 8 + 2 * FF_EFFECT_SIZE
+UI_BEGIN_FF_UPLOAD = _IOC(3, "U", 200, FF_UPLOAD_SIZE)
+UI_END_FF_UPLOAD = _IOC(1, "U", 201, FF_UPLOAD_SIZE)
+UI_BEGIN_FF_ERASE = _IOC(3, "U", 202, 12)
+UI_END_FF_ERASE = _IOC(1, "U", 203, 12)
 
 running = True
 def log(msg):
@@ -65,24 +83,50 @@ def find_receiver():
         except (OSError, ValueError): continue
     return None
 
+
+def receiver_serial(syspath):
+    try:
+        with open(syspath + "/serial") as descriptor:
+            return descriptor.read().strip() or None
+    except OSError:
+        return None
+
 class Uinput:
-    def __init__(self, vendor, product, version):
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-        for ev in (EV_KEY, EV_ABS): fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
-        for b in BUTTONS: fcntl.ioctl(self.fd, UI_SET_KEYBIT, b)
-        for code, mn, mx, fuzz, flat in AXES:
-            fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
-            fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("HHiiiiii", code, 0, 0, mn, mx, fuzz, flat, 0))
-        setup = struct.pack("HHHH", 0x03, vendor, product, version) + UINPUT_NAME.encode().ljust(80, b"\0") + struct.pack("I", 0)
-        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup); fcntl.ioctl(self.fd, UI_DEV_CREATE)
+    def __init__(self, vendor, product, version, rumble=False):
+        mode = os.O_RDWR if rumble else os.O_WRONLY
+        self.fd = os.open("/dev/uinput", mode | os.O_NONBLOCK)
+        try:
+            for ev in (EV_KEY, EV_ABS): fcntl.ioctl(self.fd, UI_SET_EVBIT, ev)
+            for b in BUTTONS: fcntl.ioctl(self.fd, UI_SET_KEYBIT, b)
+            for code, mn, mx, fuzz, flat in AXES:
+                fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
+                fcntl.ioctl(self.fd, UI_ABS_SETUP, struct.pack("HHiiiiii", code, 0, 0, mn, mx, fuzz, flat, 0))
+            if rumble:
+                fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_FF)
+                fcntl.ioctl(self.fd, UI_SET_FFBIT, FF_RUMBLE)
+            setup = struct.pack("HHHH", 0x03, vendor, product, version)
+            setup += UINPUT_NAME.encode().ljust(80, b"\0") + struct.pack("I", FF_EFFECTS_MAX if rumble else 0)
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        except OSError:
+            os.close(self.fd)
+            raise
         self.state = {}
-    def emit(self, changes):
-        if not changes: return
+    def forward(self, state):
+        changes = [(t, c, v) for (t, c), v in state.items() if self.state.get((t, c)) != v]
+        if not changes:
+            return 0
         now = time.time(); sec, usec = int(now), int((now % 1) * 1e6)
         buf = b"".join(struct.pack(EVENT_FMT, sec, usec, t, c, v) for t, c, v in changes)
         buf += struct.pack(EVENT_FMT, sec, usec, EV_SYN, 0, 0)
-        try: os.write(self.fd, buf)
-        except OSError as e: log("uinput write error: %s" % e)
+        try:
+            if os.write(self.fd, buf) != len(buf):
+                raise OSError("incomplete input event write")
+        except OSError as e:
+            log("uinput write error: %s" % e)
+            return None
+        self.state.update(state)
+        return len(changes)
     def close(self):
         try: fcntl.ioctl(self.fd, UI_DEV_DESTROY)
         except OSError: pass
@@ -107,6 +151,7 @@ class Receiver:
     def __init__(self, bus, dev):
         self.fd = os.open("/dev/bus/usb/%03d/%03d" % (bus, dev), os.O_RDWR)
         self.claimed = False
+        self.output_lock = threading.Lock()
     def driver_ioctl(self, code):
         s = struct.pack("ii", 0, code).ljust(SZ_IOCTL, b"\0")
         try: fcntl.ioctl(self.fd, USBDEVFS_IOCTL, bytearray(s)); return True
@@ -127,11 +172,16 @@ class Receiver:
     def handshake(self):
         """What an XInput host does: vendor capability requests, then the set-LED packet. The receiver
         only starts streaming input reports after this."""
-        for value, length in ((0x0100, 20), (0x0000, 4)):
-            try: self.control(0xC1, 0x01, value, 0x0000, length)
-            except OSError as e: log("capability request %#06x failed: %s" % (value, e))
-        try: self.xfer(EP_OUT, LED_PACKET, timeout=500); return True
-        except OSError as e: log("LED packet failed: %s" % e); return False
+        with self.output_lock:
+            for value, length in ((0x0100, 20), (0x0000, 4)):
+                try: self.control(0xC1, 0x01, value, 0x0000, length)
+                except OSError as e: log("capability request %#06x failed: %s" % (value, e))
+            try: self.xfer(EP_OUT, LED_PACKET, timeout=500); return True
+            except OSError as e: log("LED packet failed: %s" % e); return False
+
+    def rumble(self, strong, weak):
+        with self.output_lock:
+            self.xfer(EP_OUT, bytes((0, 8, 0, strong, weak, 0, 0, 0)), timeout=200)
     def close(self):
         if self.claimed:
             try: fcntl.ioctl(self.fd, USBDEVFS_RELEASE, struct.pack("I", 0))
@@ -139,14 +189,226 @@ class Receiver:
             self.driver_ioctl(USBDEVFS_CONNECT)       # give the interface back to xpad
         os.close(self.fd)
 
-def serve(syspath, bus, dev):
+class Rumble:
+    def __init__(self, pad, receiver=None):
+        self.fd = pad.fd
+        self.receiver = receiver
+        self.receiver_lock = threading.Lock()
+        self.effects = {}
+        self.playing = None
+        self.motor_state = (0, 0)
+        self.last_report = None
+        self.stop_requested = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="controller-rumble")
+        self.logged_first_pulse = False
+
+    def upload(self, request_id):
+        data = bytearray(FF_UPLOAD_SIZE)
+        struct.pack_into("=I", data, 0, request_id)
+        fcntl.ioctl(self.fd, UI_BEGIN_FF_UPLOAD, data)
+        effect_type, effect_id = struct.unpack_from("=Hh", data, 8)
+        result = -errno.EINVAL
+        if effect_type == FF_RUMBLE and 0 <= effect_id < FF_EFFECTS_MAX:
+            length, delay = struct.unpack_from("=HH", data, 18)
+            strong, weak = struct.unpack_from("=HH", data, 24)
+            self.effects[effect_id] = (strong >> 8, weak >> 8, length, delay)
+            result = 0
+        struct.pack_into("=i", data, 4, result)
+        fcntl.ioctl(self.fd, UI_END_FF_UPLOAD, data)
+
+    def erase(self, request_id):
+        data = bytearray(12)
+        struct.pack_into("=I", data, 0, request_id)
+        fcntl.ioctl(self.fd, UI_BEGIN_FF_ERASE, data)
+        effect_id, = struct.unpack_from("=I", data, 8)
+        self.effects.pop(effect_id, None)
+        struct.pack_into("=i", data, 4, 0)
+        fcntl.ioctl(self.fd, UI_END_FF_ERASE, data)
+        if self.playing is not None and self.playing[0] == effect_id:
+            self.playing = None
+
+    def handle_event(self, event_type, code, value):
+        if event_type == EV_UINPUT:
+            if code == UI_FF_UPLOAD:
+                self.upload(value)
+            elif code == UI_FF_ERASE:
+                self.erase(value)
+        elif event_type == EV_FF and self.receiver is not None and code in self.effects:
+            if value > 0:
+                strong, weak, length, delay = self.effects[code]
+                starts = time.monotonic() + delay / 1000
+                ends = starts + length * value / 1000 if length else None
+                self.playing = (code, (strong, weak), starts, ends)
+            elif self.playing is not None and self.playing[0] == code:
+                self.playing = None
+
+    def update_motors(self):
+        if self.receiver is None:
+            return
+        motors = (0, 0)
+        if self.playing is not None:
+            _, requested, starts, ends = self.playing
+            now = time.monotonic()
+            if ends is not None and now >= ends:
+                self.playing = None
+            elif now >= starts:
+                last_report = self.last_report
+                if last_report is None or now - last_report >= RUMBLE_INPUT_TIMEOUT_S:
+                    if self.motor_state != (0, 0):
+                        log("rumble stopped after input reports went quiet")
+                    self.playing = None
+                else:
+                    motors = requested
+        if motors != self.motor_state:
+            # A failed start may still have reached the receiver. A failed
+            # stop should leave the worker's final stop attempt armed.
+            if motors != (0, 0):
+                self.motor_state = motors
+            self.receiver.rumble(*motors)
+            self.motor_state = motors
+            if motors != (0, 0) and not self.logged_first_pulse:
+                log("first force-feedback request forwarded to receiver")
+                self.logged_first_pulse = True
+
+    def attach(self, receiver):
+        with self.receiver_lock:
+            self.receiver = receiver
+            self.last_report = None
+            self.logged_first_pulse = False
+
+    def detach(self):
+        with self.receiver_lock:
+            self.stop_motors()
+            self.playing = None
+            self.last_report = None
+            self.receiver = None
+
+    def stop_motors(self):
+        if self.receiver is not None and self.motor_state != (0, 0):
+            try:
+                self.receiver.rumble(0, 0)
+            except OSError as e:
+                if e.errno not in (errno.ENODEV, errno.ESHUTDOWN):
+                    log("rumble stop failed: %s" % e)
+        self.motor_state = (0, 0)
+
+    def run(self):
+        try:
+            while not self.stop_requested.is_set():
+                readable, _, _ = select.select([self.fd], [], [], 0.025)
+                data = b""
+                if readable:
+                    try:
+                        data = os.read(self.fd, EVENT_SIZE * 32)
+                    except BlockingIOError:
+                        pass
+                with self.receiver_lock:
+                    for _, _, event_type, code, value in struct.iter_unpack(EVENT_FMT, data):
+                        self.handle_event(event_type, code, value)
+                    try:
+                        self.update_motors()
+                    except OSError as e:
+                        log("rumble transfer failed: %s" % e)
+                        self.playing = None
+                        self.stop_motors()
+        except OSError as e:
+            log("rumble worker stopped: %s" % e)
+        finally:
+            self.detach()
+
+    def close(self):
+        self.stop_requested.set()
+        self.thread.join()
+
+
+class PadSession:
+    def __init__(self, rumble_enabled):
+        self.rumble_enabled = rumble_enabled
+        self.pad = None
+        self.feedback = None
+        self.remove_at = None
+        self.serial = None
+        self.port = None
+
+    def prepare(self, syspath, version):
+        self.expire()
+        serial = receiver_serial(syspath)
+        port = os.path.basename(syspath)
+        if self.pad is not None:
+            same_receiver = self.serial == serial if self.serial and serial else self.port == port
+            if same_receiver:
+                self.serial = serial or self.serial
+                self.port = port
+                return
+            self.close()
+        rumble = self.rumble_enabled
+        try:
+            self.pad = Uinput(VID, PID, version, rumble=rumble)
+        except OSError:
+            if not rumble:
+                raise
+            log("force feedback unavailable; creating an input-only device")
+            rumble = False
+            self.pad = Uinput(VID, PID, version)
+        self.serial = serial
+        self.port = port
+        log("uinput device created: %r" % UINPUT_NAME)
+        if rumble:
+            worker = Rumble(self.pad)
+            worker.thread.start()
+            self.feedback = worker
+            log("force feedback enabled")
+        # The first pad must be visible to webOS before native xpad detaches.
+        time.sleep(0.5)
+
+    def attach(self, receiver):
+        if self.feedback is not None:
+            self.feedback.attach(receiver)
+        if self.remove_at is not None:
+            log("receiver returned; reusing the existing uinput device")
+        self.remove_at = None
+
+    def forward(self, state):
+        if self.feedback is not None:
+            self.feedback.last_report = time.monotonic()
+        return self.pad.forward(state)
+
+    def detach(self):
+        if self.feedback is not None:
+            self.feedback.detach()
+        if self.pad is None or self.remove_at is not None:
+            return
+        if self.pad.forward(dict.fromkeys(self.pad.state, 0)) is None:
+            self.close()
+            return
+        self.remove_at = time.monotonic() + RECONNECT_GRACE_S
+        log("receiver unavailable; holding the neutral uinput device for %gs" % RECONNECT_GRACE_S)
+
+    def expire(self):
+        if self.remove_at is not None and time.monotonic() >= self.remove_at:
+            self.close()
+
+    def close(self):
+        if self.feedback is not None:
+            self.feedback.close()
+            self.feedback = None
+        if self.pad is not None:
+            self.pad.close()
+            self.pad = None
+            log("uinput device removed")
+        self.remove_at = None
+        self.serial = None
+        self.port = None
+
+
+def serve(syspath, bus, dev, session):
     version = int(open(syspath + "/bcdDevice").read(), 16)
-    rx = Receiver(bus, dev); ui = None
+    rx = Receiver(bus, dev)
     try:
-        ui = Uinput(VID, PID, version); log("uinput device created: %r" % UINPUT_NAME)
-        time.sleep(0.5)                                   # let the compositor pick up the new node first
+        session.prepare(syspath, version)
         rx.claim(); log("claimed %s (bus %d dev %d); xpad detached" % (os.path.basename(syspath), bus, dev))
         rx.handshake(); last_led = time.time(); last_report = 0.0; reports = 0; events = 0; tick = time.time()
+        session.attach(rx)
         while running:
             try: r = rx.xfer(EP_IN, length=32, timeout=500)
             except OSError as e:
@@ -161,26 +423,38 @@ def serve(syspath, bus, dev):
             if state is None: continue
             if last_report == 0.0: log("input reports flowing (first report %s)" % r.hex())
             last_report = time.time(); reports += 1
-            changes = [(t, c, v) for (t, c), v in state.items() if ui.state.get((t, c)) != v]
-            ui.state.update(state); ui.emit(changes); events += len(changes)
+            events += session.forward(state) or 0
             if time.time() - tick >= 300: log("stats: %d reports, %d events in last 5 min" % (reports, events)); reports = events = 0; tick = time.time()
     finally:
-        if ui: ui.close()
-        rx.close(); log("released interface; uinput destroyed")
+        try:
+            session.detach()
+        finally:
+            rx.close()
+            log("released receiver interface")
 
 def main():
     def stop(signum, frame):
         global running; running = False
     signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
     log("bridge starting (pid %d), waiting for %04x:%04x" % (os.getpid(), VID, PID))
-    while running:
-        found = find_receiver()
-        if not found: time.sleep(1.0); continue
-        syspath, bus, dev = found
-        try: serve(syspath, bus, dev)
-        except OSError as e: log("serve failed: %s" % e)
-        # wait until this device instance disappears (re-enumeration gives a new devnum)
-        while running and find_receiver() == found: time.sleep(1.0)
+    session = PadSession(os.path.isfile(RUMBLE_FLAG))
+    try:
+        while running:
+            session.expire()
+            found = find_receiver()
+            if not found:
+                time.sleep(1.0)
+                continue
+            try:
+                serve(*found, session)
+            except OSError as e:
+                log("serve failed: %s" % e)
+            # Re-enumeration gives a new device number even on the same port.
+            while running and find_receiver() == found:
+                session.expire()
+                time.sleep(1.0)
+    finally:
+        session.close()
     log("bridge stopped")
 
 if __name__ == "__main__": main()
