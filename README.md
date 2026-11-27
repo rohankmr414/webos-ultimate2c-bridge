@@ -8,10 +8,10 @@ Without it, the TV detects the receiver but the controller never sends any input
 
 | TV | webOS | Kernel | Result |
 |---|---|---|---|
-| LG OLED55B49LA | 10.3.1 | 5.4.268-294.24.papikonda.2 (aarch64) | Working, including several controllers at once and Moonlight |
+| LG OLED55B49LA | 10.3.1 | 5.4.268-294.24.papikonda.2 (aarch64) | Working, including several controllers at once, Moonlight, and rumble on two controllers |
 | LG 55UR7500PSC | 10.3.2 (firmware 33.31.75) | 5.4.268 | Working with one controller: D-pad navigation on the Home screen |
 
-Both TVs are rooted with the Homebrew Channel. Not checked yet: behaviour after sleep and wake, and rumble with several controllers at once. If you test another model, a PR adding a row is welcome.
+Both TVs are rooted with the Homebrew Channel. Not checked yet: behaviour after sleep and wake. If you test another model, a PR adding a row is welcome.
 
 ## Install
 
@@ -61,7 +61,7 @@ ssh lgtv 'touch /media/developer/ultimate2c/rumble-enabled' && sh install.sh
 
 The pads then advertise standard two-motor force feedback. Reopen Moonlight afterwards so it picks up the new controller capabilities. To turn rumble off again, delete the marker and restart the bridge.
 
-The bridge sends motor commands from a separate thread, so input keeps flowing while the motors run. It stops the motors if input reports stop arriving, or when the receiver disconnects.
+The bridge sends motor commands from a separate thread, so input keeps flowing while the motors run. It stops the motors if input reports stop arriving, or when the receiver disconnects. The receiver only sends a report when something on the controller changes, so rumble stops after 0.3 s if nobody is touching the controller or a stick is held still.
 
 ## Troubleshooting
 
