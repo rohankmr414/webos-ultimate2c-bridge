@@ -12,6 +12,10 @@ driver would have produced, so webOS (libim) and apps treat it as a normal pad.
 Rumble is opt-in. When enabled, a worker handles uinput feedback and sends motor
 commands concurrently with the receiver's input reads.
 
+Each receiver pairs with one controller. Up to MAX_PLAYERS receivers are served at once,
+each in its own thread with its own uinput pad and player LED. A player slot keeps its pad
+through the reconnect grace period, so a returning receiver gets its old slot back.
+
 Run as root. Stops cleanly on SIGTERM/SIGINT and hands the interface back to xpad.
 """
 import os, sys, time, struct, ctypes, fcntl, errno, signal, glob
@@ -21,6 +25,7 @@ import threading
 VID, PID = 0x2dc8, 0x310a
 EP_IN, EP_OUT = 0x84, 0x05
 LED_PACKET = b"\x01\x03\x02"          # Xbox 360 "set LED" (player 1 blink/solid)
+MAX_PLAYERS = 4                        # the Xbox 360 LED protocol has four player slots
 HANDSHAKE_RETRY_S = 10.0               # until the first report: repeat the handshake this often
 SILENCE_RETRY_S = 60.0                 # after reports have been seen: repeat only after this much silence
 LOG = "/tmp/ultimate2c-bridge.log"
@@ -65,23 +70,35 @@ UI_BEGIN_FF_ERASE = _IOC(3, "U", 202, 12)
 UI_END_FF_ERASE = _IOC(1, "U", 203, 12)
 
 running = True
+_log_lock = threading.Lock()
 def log(msg):
     line = "%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg)
-    sys.stdout.write(line); sys.stdout.flush()
-    try:
-        if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000: os.replace(LOG, LOG + ".old")
-        with open(LOG, "a") as f: f.write(line)
-    except OSError: pass
-
-def find_receiver():
-    for d in glob.glob("/sys/bus/usb/devices/*"):
+    with _log_lock:
+        sys.stdout.write(line); sys.stdout.flush()
         try:
-            if int(open(d + "/idVendor").read(), 16) != VID or int(open(d + "/idProduct").read(), 16) != PID: continue
+            if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000: os.replace(LOG, LOG + ".old")
+            with open(LOG, "a") as f: f.write(line)
+        except OSError: pass
+
+def led_packet(player):
+    """Xbox 360 set-LED packet: pattern 2..5 = "blink, then light player 1..4"."""
+    if not 1 <= player <= MAX_PLAYERS: raise ValueError("player must be 1..%d, got %r" % (MAX_PLAYERS, player))
+    return bytes([0x01, 0x03, 0x01 + player])
+
+def _read(path):
+    with open(path) as f: return f.read()
+
+def find_receivers():
+    """All receivers in XInput mode as (syspath, busnum, devnum), sorted by syspath."""
+    found = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            if int(_read(d + "/idVendor"), 16) != VID or int(_read(d + "/idProduct"), 16) != PID: continue
             intf = d + "/" + os.path.basename(d) + ":1.0"
-            if open(intf + "/bInterfaceClass").read().strip() != "ff" or open(intf + "/bInterfaceSubClass").read().strip() != "5d": continue
-            return d, int(open(d + "/busnum").read()), int(open(d + "/devnum").read())
+            if _read(intf + "/bInterfaceClass").strip() != "ff" or _read(intf + "/bInterfaceSubClass").strip() != "5d": continue
+            found.append((d, int(_read(d + "/busnum")), int(_read(d + "/devnum"))))
         except (OSError, ValueError): continue
-    return None
+    return found
 
 
 def receiver_serial(syspath):
@@ -148,7 +165,8 @@ def parse_report(r):
     return s
 
 class Receiver:
-    def __init__(self, bus, dev):
+    def __init__(self, bus, dev, player=1):
+        self.led = led_packet(player)
         self.fd = os.open("/dev/bus/usb/%03d/%03d" % (bus, dev), os.O_RDWR)
         self.claimed = False
         self.output_lock = threading.Lock()
@@ -176,7 +194,7 @@ class Receiver:
             for value, length in ((0x0100, 20), (0x0000, 4)):
                 try: self.control(0xC1, 0x01, value, 0x0000, length)
                 except OSError as e: log("capability request %#06x failed: %s" % (value, e))
-            try: self.xfer(EP_OUT, LED_PACKET, timeout=500); return True
+            try: self.xfer(EP_OUT, self.led, timeout=500); return True
             except OSError as e: log("LED packet failed: %s" % e); return False
 
     def rumble(self, strong, weak):
@@ -322,21 +340,29 @@ class Rumble:
 
 
 class PadSession:
-    def __init__(self, rumble_enabled):
+    """One player slot: its uinput pad, optional rumble worker, and the receiver it last served."""
+    def __init__(self, rumble_enabled, player=1):
         self.rumble_enabled = rumble_enabled
+        self.player = player
         self.pad = None
         self.feedback = None
         self.remove_at = None
         self.serial = None
         self.port = None
 
+    def matches(self, syspath):
+        """True if this slot holds a pad for the receiver at syspath: same USB serial, or same port if either has none."""
+        if self.pad is None:
+            return False
+        serial = receiver_serial(syspath)
+        return self.serial == serial if self.serial and serial else self.port == os.path.basename(syspath)
+
     def prepare(self, syspath, version):
         self.expire()
         serial = receiver_serial(syspath)
         port = os.path.basename(syspath)
         if self.pad is not None:
-            same_receiver = self.serial == serial if self.serial and serial else self.port == port
-            if same_receiver:
+            if self.matches(syspath):
                 self.serial = serial or self.serial
                 self.port = port
                 return
@@ -352,7 +378,7 @@ class PadSession:
             self.pad = Uinput(VID, PID, version)
         self.serial = serial
         self.port = port
-        log("uinput device created: %r" % UINPUT_NAME)
+        log("uinput device created: %r (player %d)" % (UINPUT_NAME, self.player))
         if rumble:
             worker = Rumble(self.pad)
             worker.thread.start()
@@ -402,11 +428,11 @@ class PadSession:
 
 
 def serve(syspath, bus, dev, session):
-    version = int(open(syspath + "/bcdDevice").read(), 16)
-    rx = Receiver(bus, dev)
+    version = int(_read(syspath + "/bcdDevice"), 16)
+    rx = Receiver(bus, dev, session.player)
     try:
         session.prepare(syspath, version)
-        rx.claim(); log("claimed %s (bus %d dev %d); xpad detached" % (os.path.basename(syspath), bus, dev))
+        rx.claim(); log("claimed %s (bus %d dev %d) as player %d; xpad detached" % (os.path.basename(syspath), bus, dev, session.player))
         rx.handshake(); last_led = time.time(); last_report = 0.0; reports = 0; events = 0; tick = time.time()
         session.attach(rx)
         while running:
@@ -432,29 +458,58 @@ def serve(syspath, bus, dev, session):
             rx.close()
             log("released receiver interface")
 
+def pick_session(syspath, idle):
+    """Slot for a new receiver: the one holding its pad, else the lowest empty one, else the held pad nearest expiry."""
+    for session in idle:
+        if session.matches(syspath): return session
+    for session in idle:
+        if session.pad is None: return session
+    held = [session for session in idle if session.remove_at is not None]
+    return min(held, key=lambda session: session.remove_at) if held else None
+
 def main():
+    global running
     def stop(signum, frame):
         global running; running = False
     signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
-    log("bridge starting (pid %d), waiting for %04x:%04x" % (os.getpid(), VID, PID))
-    session = PadSession(os.path.isfile(RUMBLE_FLAG))
+    log("bridge starting (pid %d), waiting for %04x:%04x (up to %d)" % (os.getpid(), VID, PID, MAX_PLAYERS))
+    rumble = os.path.isfile(RUMBLE_FLAG)
+    sessions = [PadSession(rumble, player) for player in range(1, MAX_PLAYERS + 1)]
+
+    def run(key, session):
+        try: serve(*key, session)
+        except OSError as e: log("serve failed for %s: %s" % (os.path.basename(key[0]), e))
+
+    workers = {}      # (syspath, bus, dev) -> (thread, session)
+    finished = set()  # instances whose serve() returned; not served again until they re-enumerate
+    waiting = set()   # instances already logged as waiting for a free player slot
     try:
         while running:
-            session.expire()
-            found = find_receiver()
-            if not found:
-                time.sleep(1.0)
-                continue
-            try:
-                serve(*found, session)
-            except OSError as e:
-                log("serve failed: %s" % e)
-            # Re-enumeration gives a new device number even on the same port.
-            while running and find_receiver() == found:
-                session.expire()
-                time.sleep(1.0)
+            for key, (thread, _) in list(workers.items()):
+                if not thread.is_alive(): del workers[key]; finished.add(key)
+            present = set(find_receivers())
+            finished &= present; waiting &= present
+            busy = [session for _, session in workers.values()]
+            idle = [session for session in sessions if session not in busy]
+            for session in idle: session.expire()
+            # A slot whose receiver has vanished but whose thread is still winding down.
+            leaving = [session for key, (_, session) in workers.items() if key not in present]
+            for key in sorted(present - finished - set(workers)):
+                if any(session.matches(key[0]) for session in leaving):
+                    continue                  # same receiver re-enumerated; wait for its slot to free up
+                session = pick_session(key[0], idle)
+                if session is None:
+                    if key not in waiting:
+                        log("%s waiting: all %d player slots in use" % (os.path.basename(key[0]), MAX_PLAYERS)); waiting.add(key)
+                    continue
+                waiting.discard(key); idle.remove(session)
+                thread = threading.Thread(target=run, args=(key, session), name="serve-p%d" % session.player, daemon=True)
+                workers[key] = (thread, session); thread.start()
+            time.sleep(1.0)
     finally:
-        session.close()
+        running = False                       # also on an unexpected error, so the workers stop
+        for thread, _ in workers.values(): thread.join()
+        for session in sessions: session.close()
     log("bridge stopped")
 
 if __name__ == "__main__": main()

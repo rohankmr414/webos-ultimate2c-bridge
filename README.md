@@ -22,15 +22,19 @@ Observed on the receiver's XInput interface:
 
 ## The fix
 
-`ultimate2c-bridge.py` is a small root daemon that replaces `xpad` for this one device:
+`ultimate2c-bridge.py` is a small root daemon that replaces `xpad` for this device. For each receiver it finds:
 
 1. Waits for `2dc8:310a` to appear in `/sys/bus/usb/devices`.
 2. Creates a uinput pad named "Generic X-Box pad" (bus USB, `2dc8:310a`) with the same buttons, axes and ranges `xpad` would create.
-3. Detaches `xpad` from interface 0 via usbfs, claims it, sends the XInput capability requests and the LED packet.
+3. Detaches `xpad` from interface 0 via usbfs, claims it, sends the XInput capability requests and the LED packet for its player number.
 4. Parses the XInput reports with the `xpad` mapping and writes only changed values to uinput.
 5. Repeats the handshake every 10 s until the first report, then only after 60 s of silence. When the receiver disappears or enters "8BitDo IDLE", the bridge releases held inputs and leaves the virtual pad connected for up to 15 seconds. The same receiver can reuse that pad and its force-feedback effects. The bridge identifies it by USB serial, with a same-port fallback for receivers that provide no serial.
 
 Log: `/tmp/ultimate2c-bridge.log`.
+
+## Multiple controllers
+
+Each receiver pairs with one controller, so plug in one receiver per controller. Up to four receivers are served at once, each in its own thread with its own pad and player number (LED packet `01 03 02` to `01 03 05`). A new receiver gets the slot already holding its pad, else the lowest free one. A fifth receiver waits until a slot frees up. Unplugging one receiver doesn't affect the others.
 
 ## Optional rumble
 
@@ -76,6 +80,7 @@ Removes the marker, hook and daemon; the kernel `xpad` driver rebinds automatica
 | `48-ultimate2c-bridge` | Homebrew Channel startup hook |
 | `install.sh` / `uninstall.sh` | Run from a workstation with SSH access to the TV |
 | `tests/test_bridge.py` | Hardware-free unit tests |
+| `tests/test_multi_receiver.py` | Unit tests for several receivers and player slots |
 
 ## Tests
 

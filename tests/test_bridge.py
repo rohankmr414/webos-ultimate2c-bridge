@@ -147,14 +147,14 @@ class FindReceiver(Base):
     def find(self):
         with mock.patch.object(bridge.glob, "glob", lambda pat: sorted(
                 os.path.join(self.tmp.name, n) for n in os.listdir(self.tmp.name) if not n.endswith(".log"))):
-            return bridge.find_receiver()
+            return bridge.find_receivers()
 
     def test_none(self):
-        self.assertIsNone(self.find())
+        self.assertEqual(self.find(), [])
 
     def test_finds_matching_device(self):
         d = self.make_dev("1-1", busnum=1, devnum=7)
-        self.assertEqual(self.find(), (d, 1, 7))
+        self.assertEqual(self.find(), [(d, 1, 7)])
 
     def test_skips_non_matching(self):
         self.make_dev("1-1", pid="3106")
@@ -162,9 +162,9 @@ class FindReceiver(Base):
         self.make_dev("1-3", cls="03", sub="00")           # receiver in HID mode
         self.make_dev("1-4", intf=False)                   # interface not populated yet
         os.makedirs(os.path.join(self.tmp.name, "1-0:1.0"))  # interface entries have no idVendor
-        self.assertIsNone(self.find())
+        self.assertEqual(self.find(), [])
         d = self.make_dev("2-1", busnum=2, devnum=3)
-        self.assertEqual(self.find(), (d, 2, 3))
+        self.assertEqual(self.find(), [(d, 2, 3)])
 
 
 class UinputTest(Base):
@@ -319,7 +319,7 @@ class FakeReceiver:
     """Plays a script of reads: bytes are reports, ints are errnos. Each timeout advances the clock 0.5 s."""
     def __init__(self, test, script):
         self.test, self.script, self.handshakes, self.closed, self.claimed = test, list(script), [], False, False
-    def __call__(self, bus, dev): return self
+    def __call__(self, bus, dev, player=1): self.player = player; return self
     def claim(self): self.claimed = True
     def handshake(self): self.handshakes.append(self.test.now); return True
     def xfer(self, ep, data=None, length=32, timeout=500):
@@ -570,33 +570,6 @@ class RumbleTest(Base):
         rx.xfer = lambda ep, data=None, length=32, timeout=500: sent.append((ep, data, timeout))
         rx.rumble(255, 128)
         self.assertEqual(sent, [(bridge.EP_OUT, bytes([0, 8, 0, 255, 128, 0, 0, 0]), 200)])
-
-
-class MainTest(Base):
-    def test_waits_for_new_instance_after_serve(self):
-        found = ("/sys/x", 1, 5)
-        seq = iter([None, found, found, found, ("/sys/x", 1, 6), ("/sys/x", 1, 6)])
-        served = []
-        def fake_serve(*a):
-            served.append(a[:3])
-            if len(served) == 2: bridge.running = False
-        with mock.patch.object(bridge, "find_receiver", lambda: next(seq)), \
-             mock.patch.object(bridge, "serve", fake_serve), mock.patch.object(bridge.time, "sleep", lambda s: None), \
-             mock.patch.object(bridge.signal, "signal"):
-            bridge.main()
-        self.assertEqual(served, [found, ("/sys/x", 1, 6)])   # same devnum is not served twice
-        self.assertIn("bridge stopped", self.logged())
-
-    def test_serve_failure_is_logged(self):
-        calls = iter([("/sys/x", 1, 5)])
-        def find():
-            try: return next(calls)
-            except StopIteration: bridge.running = False; return None
-        with mock.patch.object(bridge, "find_receiver", find), \
-             mock.patch.object(bridge, "serve", side_effect=OSError(errno.EACCES, "denied")), \
-             mock.patch.object(bridge.time, "sleep", lambda s: None), mock.patch.object(bridge.signal, "signal"):
-            bridge.main()
-        self.assertIn("serve failed", self.logged())
 
 
 if __name__ == "__main__":
